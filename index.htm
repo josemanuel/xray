@@ -28,6 +28,9 @@
 	<script src="res/js/jquery-3.5.1.min.js"></script>
 	<script src="res/js/tf-2.0.1.min.js"></script>
 	
+	<!-- DICOM support -->
+	<script src="res/js/dcmjs-0.29.13.js"></script>
+	
 	<script>
 	
 	function showAbout(){
@@ -201,10 +204,10 @@
 
 	<div class="col-sm-12">
 		<div id="file-container" style="display: none">
-			Process an image locally: <input type="file" id="files" name="files[]" multiple> 
-			<span class="hideiflocal"><a target="_blank" href="examples/">Download example files (opens new window)</a><br></span>
-			<a href="javascript:downloadCSV();">Download all predictions as CSV</a>
-		</div>
+		Process an image locally: <input type="file" id="files" name="files[]" multiple accept=".jpg,.jpeg,.png,.gif,.dcm,.dicom,.ima,.DCM,.DICOM,.IMA"> 
+		<!--<span class="hideiflocal"><a target="_blank" href="examples/">Download example files (opens new window)</a><br></span>-->
+		<a href="javascript:downloadCSV();">Download all predictions as CSV</a>	
+	</div>
 	</div>
 	
 	<div class="col-sm-12">
@@ -342,7 +345,7 @@ function testBrowser(){
   </tr>
   <tr>
     <td class="tg-0lax">Version</td>
-    <td class="tg-0lax">3.2  <span class="hideiflocal">(Old versions: <a href="/tools/xray-v2">v2</a>, <a href="/tools/xray-v1">v1</a>)</span></td>
+    <td class="tg-0lax">3.3 (2025-12-16, DICOM support added)</td>
   </tr>
   <tr>
     <td class="tg-0lax">Prediction Model</td>

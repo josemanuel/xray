@@ -87,6 +87,374 @@ let catElement;*/
 
 //let MODEL_CONFIG;
 
+// Helper functions for DICOM support
+
+function isDICOMFile(file) {
+	const name = file.name.toLowerCase();
+	const dicomExtensions = ['.dcm', '.dicom', '.ima'];
+	
+	// Check by extension
+	for (let ext of dicomExtensions) {
+		if (name.endsWith(ext)) {
+			return true;
+		}
+	}
+	
+	// Check by MIME type (if available)
+	if (file.type && file.type.includes('dicom')) {
+		return true;
+	}
+	
+	return false;
+}
+
+async function parseDICOMToImage(arrayBuffer, filename) {
+	try {
+		// Normalize dcmjs namespace when bundlers export as default
+		if (typeof dcmjs !== 'undefined' && dcmjs && dcmjs.default) {
+			dcmjs = dcmjs.default;
+		}
+
+		// If dcmjs isn't available, fall back to basic parser
+		if (typeof dcmjs === 'undefined') {
+			console.log("dcmjs not available, attempting basic DICOM parsing...");
+			return await parseDICOMBasic(arrayBuffer, filename);
+		}
+
+		// Parse DICOM file
+		const uint8Array = new Uint8Array(arrayBuffer);
+		console.log("DICOM file size:", uint8Array.length);
+		
+		// Try several possible dcmjs entrypoints to maximize compatibility
+		let dicomData;
+		let dataset;
+		let parsed = false;
+		
+		// Attempt common API patterns
+		try {
+			if (typeof dcmjs.parseDicom === 'function') {
+				dicomData = dcmjs.parseDicom(uint8Array);
+				parsed = true;
+			} else if (dcmjs.parse && typeof dcmjs.parse.parseDicom === 'function') {
+				dicomData = dcmjs.parse.parseDicom(uint8Array);
+				parsed = true;
+			} else if (dcmjs.data && dcmjs.data.DicomMessage && typeof dcmjs.data.DicomMessage.readFile === 'function') {
+				dicomData = dcmjs.data.DicomMessage.readFile(uint8Array);
+				parsed = true;
+			} else if (dcmjs.data && dcmjs.data.DicomMessage && typeof dcmjs.data.DicomMessage.parse === 'function') {
+				dicomData = dcmjs.data.DicomMessage.parse(uint8Array);
+				parsed = true;
+			}
+		} catch(parseErr) {
+			console.warn('dcmjs parse attempt failed:', parseErr);
+			parsed = false;
+		}
+		
+		if (!parsed || !dicomData) {
+			console.log("dcmjs API not recognized or parse failed, attempting basic parsing...");
+			return await parseDICOMBasic(arrayBuffer, filename);
+		}
+		
+		dataset = dicomData.dict || dicomData.dataSet || dicomData;
+		console.log("DICOM parsed successfully");
+		console.log("Dataset keys:", Object.keys(dataset).slice(0, 20));
+		
+		// Extract pixel data - handle different possible structures
+		let pixelData = null;
+		
+		if (dcmjs.data && dcmjs.data.BitStream && dcmjs.data.BitStream.readDicomEncapsulatedPixelData) {
+			pixelData = dcmjs.data.BitStream.readDicomEncapsulatedPixelData(dataset);
+		} else if (dataset['00100010'] || dataset[7936]) {
+			// Try to get raw pixel data from dataset
+			pixelData = dataset['7FE00010'] || dataset[2147483648] || null;
+		}
+		
+		// Get image dimensions from dataset tags
+		const rows = parseInt(dataset['00280010']?.Value?.[0] || dataset[2048]?.Value?.[0] || 512);
+		const cols = parseInt(dataset['00280011']?.Value?.[0] || dataset[2049]?.Value?.[0] || 512);
+		
+		console.log(`Image dimensions: ${rows}x${cols}`);
+		
+		// If we still don't have pixel data, try alternative method
+		if (!pixelData || (Array.isArray(pixelData) && pixelData.length === 0)) {
+			// Try to extract raw encapsulated pixel data
+			const pixelDataTag = dataset['7FE00010'] || Object.keys(dataset).find(key => key.includes('FE00'));
+			if (pixelDataTag && dataset[pixelDataTag]) {
+				pixelData = dataset[pixelDataTag].Value;
+			}
+		}
+		
+		if (!pixelData) {
+			console.log("No pixel data with dcmjs, attempting to extract embedded JPEG...");
+			const jpegImg = await tryExtractJPEG(arrayBuffer);
+			if (jpegImg) return jpegImg;
+			return await parseDICOMBasic(arrayBuffer, filename);
+		}
+		
+		// Handle pixelData being an array of arrays
+		let pixelArray = Array.isArray(pixelData) && pixelData[0] ? pixelData[0] : pixelData;
+		
+		// If still an array of arrays, take first element
+		if (Array.isArray(pixelArray) && pixelArray.length > 0 && Array.isArray(pixelArray[0])) {
+			pixelArray = pixelArray[0];
+		}
+		
+		// Convert to regular array if needed
+		if (pixelArray instanceof Uint8Array || pixelArray instanceof Uint16Array) {
+			pixelArray = Array.from(pixelArray);
+		}
+		
+		if (!Array.isArray(pixelArray) || pixelArray.length === 0) {
+			console.log("Could not extract pixel array with dcmjs, attempting to extract embedded JPEG...");
+			const jpegImg2 = await tryExtractJPEG(arrayBuffer);
+			if (jpegImg2) return jpegImg2;
+			return await parseDICOMBasic(arrayBuffer, filename);
+		}
+		
+		console.log("Pixel array length:", pixelArray.length, "expected:", rows * cols);
+		
+		return createImageFromPixels(pixelArray, rows, cols);
+		
+	} catch(err) {
+		console.error("DICOM parsing with dcmjs failed: ", err);
+		console.log("Attempting basic DICOM parsing...");
+		try {
+			return await parseDICOMBasic(arrayBuffer, filename);
+		} catch(basicErr) {
+			console.error("Basic DICOM parsing also failed: ", basicErr);
+			throw new Error("Failed to parse DICOM file: " + err.message);
+		}
+	}
+}
+
+function createImageFromPixels(pixelArray, rows, cols) {
+	// Convert pixel data to canvas image
+	const canvas = document.createElement('canvas');
+	canvas.width = cols;
+	canvas.height = rows;
+	const ctx = canvas.getContext('2d');
+	const imageData = ctx.createImageData(cols, rows);
+	const data = imageData.data;
+	
+	let min = Infinity, max = -Infinity;
+	
+	// First pass: find min/max for normalization (use only available pixels)
+	const pixelCount = Math.min(pixelArray.length, rows * cols);
+	for (let i = 0; i < pixelCount; i++) {
+		const val = pixelArray[i];
+		if (typeof val === 'number') {
+			if (val < min) min = val;
+			if (val > max) max = val;
+		}
+	}
+	
+	console.log("Pixel value range: " + min + " to " + max);
+	
+	const range = max - min || 1;
+	
+	// Second pass: create image data with normalized grayscale
+	for (let i = 0; i < pixelCount; i++) {
+		const val = typeof pixelArray[i] === 'number' ? pixelArray[i] : 128;
+		const normalized = Math.max(0, Math.min(255, ((val - min) / range) * 255));
+		
+		const pixelIndex = i * 4;
+		data[pixelIndex] = normalized;     // R
+		data[pixelIndex + 1] = normalized; // G
+		data[pixelIndex + 2] = normalized; // B
+		data[pixelIndex + 3] = 255;        // A
+	}
+	
+	ctx.putImageData(imageData, 0, 0);
+	
+	// Convert canvas to image element
+	const img = document.createElement('img');
+	img.src = canvas.toDataURL('image/png');
+	img.width = cols;
+	img.height = rows;
+	
+	return new Promise((resolve, reject) => {
+		img.onload = () => resolve(img);
+		img.onerror = () => reject(new Error("Failed to load converted DICOM image"));
+	});
+}
+
+// Try to extract an embedded JPEG from the ArrayBuffer (common for encapsulated/compressed DICOM)
+async function tryExtractJPEG(arrayBuffer) {
+	try {
+		const bytes = new Uint8Array(arrayBuffer);
+		// JPEG SOI and EOI markers
+		const SOI0 = 0xFF;
+		const SOI1 = 0xD8;
+		const EOI0 = 0xFF;
+		const EOI1 = 0xD9;
+
+		let start = -1;
+		let end = -1;
+		for (let i = 0; i < bytes.length - 1; i++) {
+			if (bytes[i] === SOI0 && bytes[i+1] === SOI1) { start = i; break; }
+		}
+		if (start < 0) return null;
+		for (let i = start+2; i < bytes.length - 1; i++) {
+			if (bytes[i] === EOI0 && bytes[i+1] === EOI1) { end = i+1; break; }
+		}
+		if (end < 0) return null;
+
+		const jpegBytes = bytes.slice(start, end+1);
+		const blob = new Blob([jpegBytes], {type: 'image/jpeg'});
+		const url = URL.createObjectURL(blob);
+		const img = document.createElement('img');
+		img.src = url;
+		return await new Promise((resolve, reject) => {
+			img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+			img.onerror = (e) => { URL.revokeObjectURL(url); reject(new Error('Failed to load extracted JPEG')); };
+		});
+	} catch(err) {
+		console.warn('tryExtractJPEG failed:', err);
+		return null;
+	}
+}
+
+async function parseDICOMBasic(arrayBuffer, filename) {
+	// Basic DICOM parser that doesn't depend on external libraries
+	// Reads DICOM tags directly from binary data
+	
+	const view = new DataView(arrayBuffer);
+	const uint8Array = new Uint8Array(arrayBuffer);
+	
+	// Check for DICOM magic number (128 bytes + "DICM")
+	if (uint8Array.length < 132) {
+		throw new Error("File too small to be a valid DICOM file");
+	}
+	
+	// Check for DICM magic at byte 128
+	const dictCheck = String.fromCharCode(uint8Array[128], uint8Array[129], uint8Array[130], uint8Array[131]);
+	if (dictCheck !== 'DICM') {
+		console.log("No DICM magic found, checking for implicit VR...");
+		// Some DICOM files don't have magic, start from beginning
+		return parseDICOMImplicit(arrayBuffer, 0);
+	}
+	
+	// DICM found, read elements from byte 132 onwards
+	return parseDICOMElements(arrayBuffer, 132);
+}
+
+async function parseDICOMElements(arrayBuffer, offset) {
+	const view = new DataView(arrayBuffer);
+	const uint8Array = new Uint8Array(arrayBuffer);
+	
+	let rows = 512, cols = 512;
+	let pixelDataOffset = -1;
+	let pixelDataLength = 0;
+	let currentOffset = offset;
+	
+	// Read DICOM elements
+	while (currentOffset < arrayBuffer.byteLength - 8) {
+		const group = view.getUint16(currentOffset, true);
+		const element = view.getUint16(currentOffset + 2, true);
+		currentOffset += 4;
+		
+		// Common DICOM tags
+		if (group === 0x0028 && element === 0x0010) {
+			// Rows
+			const vr = view.getUint16(currentOffset, false);
+			currentOffset += 2;
+			rows = view.getUint16(currentOffset + 2, true);
+			console.log("Found rows: " + rows);
+			currentOffset += 4;
+		} else if (group === 0x0028 && element === 0x0011) {
+			// Columns
+			currentOffset += 2; // skip VR
+			currentOffset += 2; // skip reserved
+			cols = view.getUint16(currentOffset + 2, true);
+			console.log("Found cols: " + cols);
+			currentOffset += 4;
+		} else if (group === 0x7FE0 && element === 0x0010) {
+			// Pixel Data
+			pixelDataOffset = currentOffset + 8;
+			const length = view.getUint32(currentOffset + 4, true);
+			pixelDataLength = length;
+			console.log("Found pixel data at offset " + pixelDataOffset + ", length: " + length);
+			break;
+		} else {
+			// Skip this element
+			const vr = view.getUint16(currentOffset, false);
+			currentOffset += 2;
+			let length = 0;
+			
+			// Check if explicit VR
+			if (currentOffset + 4 < arrayBuffer.byteLength) {
+				const maybeLength = view.getUint16(currentOffset + 2, true);
+				if (maybeLength < 1000000) { // Heuristic: likely a length
+					currentOffset += 2; // reserved bytes
+					length = view.getUint32(currentOffset + 2, true);
+					currentOffset += 4;
+				} else {
+					length = view.getUint32(currentOffset, true);
+					currentOffset += 4;
+				}
+			} else {
+				break;
+			}
+			
+			currentOffset += length;
+		}
+	}
+	
+	if (pixelDataOffset < 0) {
+		// Try extracting embedded JPEG before failing
+		console.log("No pixel data tag found; attempting to extract embedded JPEG...");
+		const jpegImg = await tryExtractJPEG(arrayBuffer);
+		if (jpegImg) return jpegImg;
+		throw new Error("No pixel data found in DICOM file");
+	}
+	
+	// Extract pixel data
+	const pixelArray = new Uint8Array(arrayBuffer, pixelDataOffset, Math.min(pixelDataLength, rows * cols));
+	return createImageFromPixels(Array.from(pixelArray), rows, cols);
+}
+
+async function parseDICOMImplicit(arrayBuffer, offset) {
+	// Fallback for implicit VR DICOM files
+	const view = new DataView(arrayBuffer);
+	const uint8Array = new Uint8Array(arrayBuffer);
+	
+	let rows = 512, cols = 512;
+	let pixelDataOffset = -1;
+	let pixelDataLength = 0;
+	let currentOffset = offset;
+	
+	while (currentOffset < arrayBuffer.byteLength - 8) {
+		const group = view.getUint16(currentOffset, true);
+		const element = view.getUint16(currentOffset + 2, true);
+		const length = view.getUint32(currentOffset + 4, true);
+		
+		if (group === 0x0028 && element === 0x0010) {
+			rows = view.getUint16(currentOffset + 8, true);
+			console.log("Found rows: " + rows);
+		} else if (group === 0x0028 && element === 0x0011) {
+			cols = view.getUint16(currentOffset + 8, true);
+			console.log("Found cols: " + cols);
+		} else if (group === 0x7FE0 && element === 0x0010) {
+			pixelDataOffset = currentOffset + 8;
+			pixelDataLength = length;
+			console.log("Found pixel data at offset " + pixelDataOffset + ", length: " + length);
+			break;
+		}
+		
+		currentOffset += 8 + length;
+	}
+	
+	if (pixelDataOffset < 0) {
+		console.log("No pixel data tag found in implicit parser; attempting to extract embedded JPEG...");
+		const jpegImg = await tryExtractJPEG(arrayBuffer);
+		if (jpegImg) return jpegImg;
+		throw new Error("No pixel data found in DICOM file");
+	}
+	
+	const pixelArray = new Uint8Array(arrayBuffer, pixelDataOffset, Math.min(pixelDataLength, rows * cols));
+	return createImageFromPixels(Array.from(pixelArray), rows, cols);
+}
+
 $(function(){
 
     if (findGetParameter("local") == "true"){
@@ -125,8 +493,12 @@ $(function(){
 		for (var i = 0; i < idxs.length; i++) {
 			f = files[idxs[i]]
 
-			// Only process image files (skip non image files)
-			if (!f.type.match('image.*')) {
+			// Check if file is DICOM (by extension or DICOM magic number)
+			const isDICOM = isDICOMFile(f);
+			
+			// Only process image files or DICOM files (skip non image files)
+			if (!f.type.match('image.*') && !isDICOM) {
+				console.log("Skipping non-image file: " + f.name);
 				return;
 			}
 
@@ -135,17 +507,38 @@ $(function(){
 
 			var deferred = $.Deferred();
 
-			reader.onload = e => {
-				let img = document.createElement('img');
-				img.src = e.target.result;
+			reader.onload = async e => {
+				console.log("Processing " + f.name);
+				
+				if (isDICOM) {
+					// Handle DICOM file
+					try {
+						const dicomImg = await parseDICOMToImage(e.target.result, f.name);
+						await predict(dicomImg, false, f.name + " (DICOM)");
+						deferred.resolve();
+					} catch(err) {
+						console.error("Error processing DICOM file: " + err);
+						status("Error processing DICOM file: " + err.message);
+						deferred.resolve();
+					}
+				} else {
+					// Handle regular image file
+					let img = document.createElement('img');
+					img.src = e.target.result;
 
-				img.onload = async g => {
-					console.log("Processing " + f.name);
-					await predict(img, false, f.name);
-					deferred.resolve();
+					img.onload = async g => {
+						console.log("Processing " + f.name);
+						await predict(img, false, f.name);
+						deferred.resolve();
+					}
 				}
 			};
-			reader.readAsDataURL(f);
+			
+			if (isDICOM) {
+				reader.readAsArrayBuffer(f);
+			} else {
+				reader.readAsDataURL(f);
+			}
 
 			await deferred.promise();
 			
