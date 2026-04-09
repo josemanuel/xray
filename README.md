@@ -1,4 +1,4 @@
-# Chester the AI Radiology Assistant
+# AI Radiology Assistant
 
 Source code or this page: https://mlmed.org/tools/xray/
 
